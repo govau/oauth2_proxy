@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -12,17 +14,55 @@ import (
 
 // Server represents an HTTP server
 type Server struct {
-	Handler http.Handler
-	Opts    *Options
+	server      *http.Server
+	networkType string
+	listenAddr  string
+	tlsConfig   *tls.Config
 }
 
-// ListenAndServe will serve traffic on HTTP or HTTPS depending on TLS options
-func (s *Server) ListenAndServe() {
-	if s.Opts.TLSKeyFile != "" || s.Opts.TLSCertFile != "" {
-		s.ServeHTTPS()
+// NewServer will serve traffic on HTTP or HTTPS depending on TLS options
+func NewServer(handler http.Handler, opts *Options) (*Server, error) {
+	rv := &Server{}
+	if opts.TLSKeyFile != "" || opts.TLSCertFile != "" {
+		rv.listenAddr = opts.HTTPSAddress
+		rv.networkType = "tcp"
+		rv.tlsConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS12,
+		}
+		if rv.tlsConfig.NextProtos == nil {
+			rv.tlsConfig.NextProtos = []string{"http/1.1"}
+		}
+
+		var err error
+		rv.tlsConfig.Certificates = make([]tls.Certificate, 1)
+		rv.tlsConfig.Certificates[0], err = tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("FATAL: loading tls config (%s, %s) failed - %s", opts.TLSCertFile, opts.TLSKeyFile, err)
+		}
 	} else {
-		s.ServeHTTP()
+		HTTPAddress := opts.HTTPAddress
+		var scheme string
+
+		i := strings.Index(HTTPAddress, "://")
+		if i > -1 {
+			scheme = HTTPAddress[0:i]
+		}
+
+		switch scheme {
+		case "", "http":
+			rv.networkType = "tcp"
+		default:
+			rv.networkType = scheme
+		}
+
+		slice := strings.SplitN(HTTPAddress, "//", 2)
+		rv.listenAddr = slice[len(slice)-1]
 	}
+
+	rv.server = &http.Server{Handler: handler}
+
+	return rv, nil
 }
 
 // Used with gcpHealthcheck()
@@ -64,75 +104,34 @@ func gcpHealthcheck(h http.Handler) http.Handler {
 	})
 }
 
-// ServeHTTP constructs a net.Listener and starts handling HTTP requests
-func (s *Server) ServeHTTP() {
-	HTTPAddress := s.Opts.HTTPAddress
-	var scheme string
-
-	i := strings.Index(HTTPAddress, "://")
-	if i > -1 {
-		scheme = HTTPAddress[0:i]
-	}
-
-	var networkType string
-	switch scheme {
-	case "", "http":
-		networkType = "tcp"
-	default:
-		networkType = scheme
-	}
-
-	slice := strings.SplitN(HTTPAddress, "//", 2)
-	listenAddr := slice[len(slice)-1]
-
-	listener, err := net.Listen(networkType, listenAddr)
-	if err != nil {
-		logger.Fatalf("FATAL: listen (%s, %s) failed - %s", networkType, listenAddr, err)
-	}
-	logger.Printf("HTTP: listening on %s", listenAddr)
-
-	server := &http.Server{Handler: s.Handler}
-	err = server.Serve(listener)
-	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-		logger.Printf("ERROR: http.Serve() - %s", err)
-	}
-
-	logger.Printf("HTTP: closing %s", listener.Addr())
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.server.Shutdown(ctx)
 }
 
-// ServeHTTPS constructs a net.Listener and starts handling HTTPS requests
-func (s *Server) ServeHTTPS() {
-	addr := s.Opts.HTTPSAddress
-	config := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		MaxVersion: tls.VersionTLS12,
-	}
-	if config.NextProtos == nil {
-		config.NextProtos = []string{"http/1.1"}
+// ListenAndServe constructs a net.Listener and starts handling HTTP requests
+func (s *Server) ListenAndServe() error {
+	serverType := "HTTP"
+	if s.tlsConfig != nil {
+		serverType = "HTTPS"
 	}
 
-	var err error
-	config.Certificates = make([]tls.Certificate, 1)
-	config.Certificates[0], err = tls.LoadX509KeyPair(s.Opts.TLSCertFile, s.Opts.TLSKeyFile)
+	listener, err := net.Listen(s.networkType, s.listenAddr)
 	if err != nil {
-		logger.Fatalf("FATAL: loading tls config (%s, %s) failed - %s", s.Opts.TLSCertFile, s.Opts.TLSKeyFile, err)
+		return fmt.Errorf("FATAL: listen (%s, %s) failed - %s", s.networkType, s.listenAddr, err)
+	}
+	logger.Printf("%s: listening on %s", serverType, s.listenAddr)
+
+	if s.tlsConfig != nil {
+		listener = tls.NewListener(tcpKeepAliveListener{listener.(*net.TCPListener)}, s.tlsConfig)
 	}
 
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		logger.Fatalf("FATAL: listen (%s) failed - %s", addr, err)
-	}
-	logger.Printf("HTTPS: listening on %s", ln.Addr())
-
-	tlsListener := tls.NewListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, config)
-	srv := &http.Server{Handler: s.Handler}
-	err = srv.Serve(tlsListener)
-
-	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-		logger.Printf("ERROR: https.Serve() - %s", err)
+	err = s.server.Serve(listener)
+	if err != nil && err != http.ErrServerClosed && !strings.Contains(err.Error(), "use of closed network connection") {
+		return fmt.Errorf("ERROR: %s.Serve() - %s", strings.ToLower(serverType), err)
 	}
 
-	logger.Printf("HTTPS: closing %s", tlsListener.Addr())
+	logger.Printf("%s: closing %s", serverType, listener.Addr())
+	return nil
 }
 
 // tcpKeepAliveListener sets TCP keep-alive timeouts on accepted

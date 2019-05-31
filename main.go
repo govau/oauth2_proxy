@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -22,6 +27,7 @@ func main() {
 	emailDomains := StringArray{}
 	whitelistDomains := StringArray{}
 	upstreams := StringArray{}
+	upstreamExecs := StringArray{}
 	skipAuthRegex := StringArray{}
 	googleGroups := StringArray{}
 
@@ -35,6 +41,7 @@ func main() {
 	flagSet.String("redirect-url", "", "the OAuth Redirect URL. ie: \"https://internalapp.yourcompany.com/oauth2/callback\"")
 	flagSet.Bool("set-xauthrequest", false, "set X-Auth-Request-User and X-Auth-Request-Email response headers (useful in Nginx auth_request mode)")
 	flagSet.Var(&upstreams, "upstream", "the http url(s) of the upstream endpoint or file:// paths for static files. Routing is based on the path")
+	flagSet.Var(&upstreamExecs, "upstream-exec", "executes this command, passing on signals received to it. useful for starting colocated upstream server")
 	flagSet.Bool("pass-basic-auth", true, "pass HTTP Basic Auth, X-Forwarded-User and X-Forwarded-Email information to upstream")
 	flagSet.Bool("pass-user-headers", true, "pass X-Forwarded-User and X-Forwarded-Email information to upstream")
 	flagSet.String("basic-auth-password", "", "the password to set when passing the HTTP Basic Auth header")
@@ -165,9 +172,62 @@ func main() {
 	} else {
 		handler = LoggingHandler(oauthproxy)
 	}
-	s := &Server{
-		Handler: handler,
-		Opts:    opts,
+	s, err := NewServer(handler, opts)
+	if err != nil {
+		logger.Fatalf("ERROR: unable to create server: %s", err)
 	}
-	s.ListenAndServe()
+
+	ctx, cnc := context.WithCancel(context.Background())
+	defer cnc() // it's OK if this is called multiple times
+
+	var childProcesses []*exec.Cmd
+	for _, command := range opts.UpstreamExecs {
+		cp, err := execUpstream(ctx, command)
+		if err != nil {
+			logger.Fatalf("ERROR: unable to launch %s: %s", command, err)
+		}
+		childProcesses = append(childProcesses, cp)
+	}
+
+	// Listen for SIGTERM and pass it on to our child processes - we'll also treat an interrupt as a good reason to term
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-c // block until signal received
+		log.Println("SIGTERM received")
+
+		// Tell all the child processes to SIGTERM
+		for _, cp := range childProcesses {
+			cp.Process.Signal(syscall.SIGTERM) // we don't care if this errors
+		}
+
+		// Now wait for them all to
+		for _, cp := range childProcesses {
+			cp.Wait()
+		}
+
+		// And now call our cancel function, to shut our listener down, which should allow us to gracefully finish
+		// and again we don't care if this errors, so ignore
+		s.Shutdown(ctx)
+
+		// everything should already be dead, but give one more chance to die peacefully
+		cnc()
+	}()
+
+	err = s.ListenAndServe()
+	if err != nil {
+		logger.Fatalf("ERROR: serving: %s", err)
+	}
+}
+
+// creates and starts job, sending output/errors to our output/errors
+func execUpstream(ctx context.Context, s string) (*exec.Cmd, error) {
+	c := exec.CommandContext(ctx, s)
+	c.Stderr = os.Stderr
+	c.Stdout = os.Stdout
+	err := c.Start()
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
