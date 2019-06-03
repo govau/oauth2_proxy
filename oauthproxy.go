@@ -47,6 +47,11 @@ var SignatureHeaders = []string{
 	"Gap-Auth",
 }
 
+var (
+	ErrNeedsLogin    = errors.New("redirect to login page")
+	ErrRejectNoLogin = errors.New("no redirect")
+)
+
 // OAuthProxy is the main authentication proxy
 type OAuthProxy struct {
 	CookieSeed     string
@@ -477,20 +482,19 @@ func (p *OAuthProxy) IsValidRedirect(redirect string) bool {
 }
 
 // IsWhitelistedRequest is used to check if auth should be skipped for this request
-func (p *OAuthProxy) IsWhitelistedRequest(req *http.Request) (ok bool) {
+func (p *OAuthProxy) IsWhitelistedRequest(req *http.Request) bool {
 	isPreflightRequestAllowed := p.skipAuthPreflight && req.Method == "OPTIONS"
 	return isPreflightRequestAllowed || p.IsWhitelistedPath(req.URL.Path)
 }
 
 // IsWhitelistedPath is used to check if the request path is allowed without auth
-func (p *OAuthProxy) IsWhitelistedPath(path string) (ok bool) {
+func (p *OAuthProxy) IsWhitelistedPath(path string) bool {
 	for _, u := range p.compiledRegex {
-		ok = u.MatchString(path)
-		if ok {
-			return
+		if u.MatchString(path) {
+			return true
 		}
 	}
-	return
+	return false
 }
 
 func getRemoteAddr(req *http.Request) (s string) {
@@ -641,10 +645,10 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 
 // AuthenticateOnly checks whether the user is currently logged in
 func (p *OAuthProxy) AuthenticateOnly(rw http.ResponseWriter, req *http.Request) {
-	status := p.Authenticate(rw, req)
-	if status == http.StatusAccepted {
+	switch p.Authenticate(rw, req) {
+	case nil:
 		rw.WriteHeader(http.StatusAccepted)
-	} else {
+	default:
 		http.Error(rw, "unauthorized request", http.StatusUnauthorized)
 	}
 }
@@ -652,25 +656,29 @@ func (p *OAuthProxy) AuthenticateOnly(rw http.ResponseWriter, req *http.Request)
 // Proxy proxies the user request if the user is authenticated else it prompts
 // them to authenticate
 func (p *OAuthProxy) Proxy(rw http.ResponseWriter, req *http.Request) {
-	status := p.Authenticate(rw, req)
-	if status == http.StatusInternalServerError {
-		p.ErrorPage(rw, http.StatusInternalServerError,
-			"Internal Error", "Internal Error")
-	} else if status == http.StatusForbidden {
+	switch p.Authenticate(rw, req) {
+	case nil:
+		p.serveMux.ServeHTTP(rw, req)
+
+	case ErrNeedsLogin:
 		if p.SkipProviderButton {
 			p.OAuthStart(rw, req)
 		} else {
 			p.SignInPage(rw, req, http.StatusForbidden)
 		}
-	} else if status == http.StatusUnauthorized {
-		p.ErrorJSON(rw, status)
-	} else {
-		p.serveMux.ServeHTTP(rw, req)
+	case ErrRejectNoLogin:
+		p.ErrorJSON(rw, http.StatusUnauthorized)
+
+	default:
+		p.ErrorPage(rw, http.StatusInternalServerError,
+			"Internal Error", "Internal Error")
 	}
+
 }
 
-// Authenticate checks whether a user is authenticated
-func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int {
+// Authenticate checks whether a user is authenticated, returning nil if OK, else ErrNeedsLogin, ErrNoLogin or other errors.
+// Headers may be set on the response.
+func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) error {
 	var saveSession, clearSession, revalidated bool
 	remoteAddr := getRemoteAddr(req)
 
@@ -720,7 +728,7 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 		err = p.SaveSession(rw, req, session)
 		if err != nil {
 			logger.PrintAuthf(session.Email, req, logger.AuthError, "Save session error %s", err)
-			return http.StatusInternalServerError
+			return err
 		}
 	}
 
@@ -736,12 +744,12 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 	}
 
 	if session == nil {
-		// Check if is an ajax request and return unauthorized to avoid a redirect
+		// Check if is an ajax request and avoid a redirect
 		// to the login page
 		if p.isAjax(req) {
-			return http.StatusUnauthorized
+			return ErrRejectNoLogin
 		}
-		return http.StatusForbidden
+		return ErrNeedsLogin
 	}
 
 	// At this point, the user is authenticated. proxy normally
@@ -781,7 +789,7 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 	} else {
 		rw.Header().Set("GAP-Auth", session.Email)
 	}
-	return http.StatusAccepted
+	return nil
 }
 
 // CheckBasicAuth checks the requests Authorization header for basic auth
